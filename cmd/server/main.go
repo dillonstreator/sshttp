@@ -10,33 +10,49 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"strconv"
 	"sync"
 	"syscall"
 	"time"
 
+	"github.com/dillonstreator/sshttp/pkg/env"
 	"github.com/gliderlabs/ssh"
 	"github.com/justinas/alice"
 	"github.com/rs/zerolog"
 )
 
+type config struct {
+	LogLevel                    zerolog.Level
+	SSHPort                     int
+	HTTPPort                    int
+	IDLength                    int
+	SSHConnectionTimeoutSeconds int
+	ShutdownTimeoutSeconds      int
+	HTTPHealthCheckEndpoint     string
+	BaseURL                     string
+}
+
+var cfg = config{
+	LogLevel:                    env.Get("LOG_LEVEL", zerolog.InfoLevel, env.WithParser(zerolog.ParseLevel)),
+	SSHPort:                     env.Get("SSH_PORT", 2222),
+	HTTPPort:                    env.Get("HTTP_PORT", 8181),
+	IDLength:                    env.Get("ID_LENGTH", 32),
+	SSHConnectionTimeoutSeconds: env.Get("SSH_CONNECTION_TIMEOUT_SECONDS", 60*15),
+	ShutdownTimeoutSeconds:      env.Get("SHUTDOWN_TIMEOUT_SECONDS", 15),
+	HTTPHealthCheckEndpoint:     env.Get("HTTP_HEALTH_CHECK_ENDPOINT", "/health"),
+	BaseURL:                     env.Get("BASE_URL", "http://localhost"),
+}
+
 func main() {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	zerolog.SetGlobalLevel(cfg.LogLevel)
 	zerolog.TimeFieldFormat = time.RFC3339Nano
 	logger := zerolog.New(os.Stdout)
 
-	logLevel := zerolog.InfoLevel
-	if l, ok := os.LookupEnv("LOG_LEVEL"); ok {
-		var err error
-		logLevel, err = zerolog.ParseLevel(l)
-		if err != nil {
-			logger.Fatal().Err(err).Send()
-		}
-	}
-	zerolog.SetGlobalLevel(logLevel)
-
-	sshSrv := newSSHServer(logger)
+	sshSrv := newSSHServer(ctx, logger)
 	go func() {
-		logger.Info().Msgf("listening for ssh at %s", sshSrv.Addr)
+		logger.Info().Msgf("listening for ssh at %s%s", cfg.BaseURL, sshSrv.Addr)
 		if err := sshSrv.ListenAndServe(); err != nil && !errors.Is(err, ssh.ErrServerClosed) {
 			logger.Fatal().Err(err).Send()
 		}
@@ -44,7 +60,7 @@ func main() {
 
 	httpSrv := newHTTPServer(logger)
 	go func() {
-		logger.Info().Msgf("listening for http at %s", httpSrv.Addr)
+		logger.Info().Msgf("listening for http at %s%s", cfg.BaseURL, httpSrv.Addr)
 		if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			logger.Fatal().Err(err).Send()
 		}
@@ -59,7 +75,9 @@ func main() {
 
 	logger.Info().Msgf("shutdown signal received")
 
-	shutdownCtx, cancelShutdownCtx := context.WithTimeout(context.Background(), time.Second*15)
+	cancel()
+
+	shutdownCtx, cancelShutdownCtx := context.WithTimeout(context.Background(), time.Second*time.Duration(cfg.ShutdownTimeoutSeconds))
 	defer cancelShutdownCtx()
 
 	wg := sync.WaitGroup{}
@@ -96,40 +114,17 @@ type tunnel struct {
 
 var tunnels = make(map[string]chan *tunnel)
 
-func newSSHServer(logger zerolog.Logger) *ssh.Server {
-	port := "2222"
-	if p, ok := os.LookupEnv("SSH_PORT"); ok {
-		port = p
-	}
-
+func newSSHServer(ctx context.Context, logger zerolog.Logger) *ssh.Server {
 	rnd := rand.New(rand.NewSource(time.Now().UnixNano()))
 
-	idLen := 32
-	if l, ok := os.LookupEnv("ID_LENGTH"); ok {
-		var err error
-		idLen, err = strconv.Atoi(l)
-		if err != nil {
-			logger.Fatal().Err(err).Msgf("converting ID_LENGTH env to int")
-		}
-	}
-
-	timeoutSeconds := 60 * 15
-	if l, ok := os.LookupEnv("SSH_CONNECTION_TIMEOUT_SECONDS"); ok {
-		var err error
-		idLen, err = strconv.Atoi(l)
-		if err != nil {
-			logger.Fatal().Err(err).Msgf("converting SSH_CONNECTION_TIMEOUT_SECONDS env to int")
-		}
-	}
-
 	srv := &ssh.Server{
-		Addr: fmt.Sprintf(":%s", port),
+		Addr: fmt.Sprintf(":%d", cfg.SSHPort),
 		Handler: func(s ssh.Session) {
 			defer s.Close()
 
 			logger := logger.With().Str("remote", s.RemoteAddr().String()).Logger()
 
-			b := make([]byte, base64.RawURLEncoding.DecodedLen(idLen))
+			b := make([]byte, base64.RawURLEncoding.DecodedLen(cfg.IDLength))
 			_, err := rnd.Read(b)
 			if err != nil {
 				logger.Error().Err(err).Msg("rand reading id")
@@ -140,7 +135,7 @@ func newSSHServer(logger zerolog.Logger) *ssh.Server {
 
 			logger = logger.With().Str("id", id).Logger()
 
-			_, err = s.Write([]byte(fmt.Sprintf("%s\n", id)))
+			_, err = s.Write([]byte(fmt.Sprintf("%s:%d?id=%s\n", cfg.BaseURL, cfg.HTTPPort, id)))
 			if err != nil {
 				logger.Error().Err(err).Msg("writing id")
 				return
@@ -151,13 +146,22 @@ func newSSHServer(logger zerolog.Logger) *ssh.Server {
 				delete(tunnels, id)
 			}()
 
-			timer := time.NewTimer(time.Second * time.Duration(timeoutSeconds))
+			timer := time.NewTimer(time.Second * time.Duration(cfg.SSHConnectionTimeoutSeconds))
 			defer timer.Stop()
 
 			select {
 			case <-timer.C:
 				logger.Info().Msgf("timeout reached")
 				s.Write([]byte("timeout reached\n"))
+				return
+
+			case <-ctx.Done():
+				logger.Info().Msgf("parent context cancelled")
+				s.Write([]byte("server shutdown\n"))
+				return
+
+			case <-s.Context().Done():
+				logger.Info().Err(s.Context().Err()).Msgf("client connection context cancelled")
 				return
 
 			case tunnel := <-tunnels[id]:
@@ -179,11 +183,6 @@ func newSSHServer(logger zerolog.Logger) *ssh.Server {
 }
 
 func newHTTPServer(logger zerolog.Logger) *http.Server {
-	port := "8181"
-	if p, ok := os.LookupEnv("HTTP_PORT"); ok {
-		port = p
-	}
-
 	mux := http.NewServeMux()
 	mux.Handle("/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		id := r.URL.Query().Get("id")
@@ -211,7 +210,7 @@ func newHTTPServer(logger zerolog.Logger) *http.Server {
 			return
 		}
 	}))
-	mux.Handle("/health", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	mux.Handle(cfg.HTTPHealthCheckEndpoint, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
 
@@ -239,7 +238,7 @@ func newHTTPServer(logger zerolog.Logger) *http.Server {
 	).Then(mux)
 
 	srv := &http.Server{
-		Addr:    fmt.Sprintf(":%s", port),
+		Addr:    fmt.Sprintf(":%d", cfg.HTTPPort),
 		Handler: handler,
 	}
 
