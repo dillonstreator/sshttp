@@ -69,11 +69,11 @@ func main() {
 	wait := make(chan os.Signal, 1)
 	signal.Notify(wait, syscall.SIGINT, syscall.SIGTERM)
 
-	logger.Info().Msgf("waiting for shutdown signal")
+	logger.Info().Msg("waiting for shutdown signal")
 
 	<-wait
 
-	logger.Info().Msgf("shutdown signal received")
+	logger.Info().Msg("shutdown signal received")
 
 	cancel()
 
@@ -146,22 +146,23 @@ func newSSHServer(ctx context.Context, logger zerolog.Logger) *ssh.Server {
 				delete(tunnels, id)
 			}()
 
-			timer := time.NewTimer(time.Second * time.Duration(cfg.SSHConnectionTimeoutSeconds))
+			timeoutDuration := time.Second * time.Duration(cfg.SSHConnectionTimeoutSeconds)
+			timer := time.NewTimer(timeoutDuration)
 			defer timer.Stop()
 
 			select {
 			case <-timer.C:
-				logger.Info().Msgf("timeout reached")
+				logger.Info().Msgf("%s timeout reached", timeoutDuration.String())
 				s.Write([]byte("timeout reached\n"))
 				return
 
 			case <-ctx.Done():
-				logger.Info().Msgf("parent context cancelled")
+				logger.Info().Msg("parent context cancelled while waiting for tunnel")
 				s.Write([]byte("server shutdown\n"))
 				return
 
 			case <-s.Context().Done():
-				logger.Info().Err(s.Context().Err()).Msgf("client connection context cancelled")
+				logger.Info().Err(s.Context().Err()).Msg("client connection context cancelled while waiting for tunnel")
 				return
 
 			case tunnel := <-tunnels[id]:
