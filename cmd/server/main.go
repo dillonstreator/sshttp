@@ -2,7 +2,7 @@ package main
 
 import (
 	"context"
-	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -35,7 +35,7 @@ var cfg = config{
 	LogLevel:                    env.Get("LOG_LEVEL", zerolog.InfoLevel, env.WithParser(zerolog.ParseLevel)),
 	SSHPort:                     env.Get("SSH_PORT", 2222),
 	HTTPPort:                    env.Get("HTTP_PORT", 8181),
-	IDLength:                    env.Get("ID_LENGTH", 32),
+	IDLength:                    env.Get("ID_LENGTH", 24),
 	SSHConnectionTimeoutSeconds: env.Get("SSH_CONNECTION_TIMEOUT_SECONDS", 60*15),
 	ShutdownTimeoutSeconds:      env.Get("SHUTDOWN_TIMEOUT_SECONDS", 15),
 	HTTPHealthCheckEndpoint:     env.Get("HTTP_HEALTH_CHECK_ENDPOINT", "/health"),
@@ -122,16 +122,16 @@ func newSSHServer(ctx context.Context, logger zerolog.Logger) *ssh.Server {
 		Handler: func(s ssh.Session) {
 			defer s.Close()
 
-			logger := logger.With().Str("remote", s.RemoteAddr().String()).Logger()
+			logger := logger.With().Str("user", s.User()).Str("remote", s.RemoteAddr().String()).Logger()
 
-			b := make([]byte, base64.RawURLEncoding.DecodedLen(cfg.IDLength))
+			b := make([]byte, hex.DecodedLen(cfg.IDLength))
 			_, err := rnd.Read(b)
 			if err != nil {
 				logger.Error().Err(err).Msg("rand reading id")
 				return
 			}
 
-			id := base64.RawURLEncoding.EncodeToString(b)
+			id := hex.EncodeToString(b)
 
 			logger = logger.With().Str("id", id).Logger()
 
