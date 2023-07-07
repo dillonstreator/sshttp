@@ -57,7 +57,7 @@ func main() {
 
 	sshSrv := newSSHServer(ctx, logger)
 	go func() {
-		logger.Info().Msgf("listening for ssh at %s:%d", cfg.BaseURL, cfg.SSHPort)
+		logger.Info().Msgf("listening for ssh traffic at port %d", cfg.SSHPort)
 		if err := sshSrv.ListenAndServe(); err != nil && !errors.Is(err, ssh.ErrServerClosed) {
 			logger.Fatal().Err(err).Send()
 		}
@@ -65,7 +65,7 @@ func main() {
 
 	httpSrv := newHTTPServer(logger)
 	go func() {
-		logger.Info().Msgf("listening for http at %s:%d", cfg.BaseURL, cfg.HTTPPort)
+		logger.Info().Msgf("listening for http traffic at port %d", cfg.HTTPPort)
 		if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			logger.Fatal().Err(err).Send()
 		}
