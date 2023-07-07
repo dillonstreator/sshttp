@@ -15,12 +15,14 @@ import (
 	"time"
 
 	"github.com/dillonstreator/sshttp/pkg/env"
+	"github.com/fatih/color"
 	"github.com/gliderlabs/ssh"
-	"github.com/justinas/alice"
+	"github.com/go-chi/chi/v5"
 	"github.com/rs/zerolog"
 )
 
 type config struct {
+	Env                         environment
 	LogLevel                    zerolog.Level
 	SSHPort                     int
 	HTTPPort                    int
@@ -32,6 +34,7 @@ type config struct {
 }
 
 var cfg = config{
+	Env:                         env.Get("ENV", environmentLocal, env.WithParser(parseEnvironment)),
 	LogLevel:                    env.Get("LOG_LEVEL", zerolog.InfoLevel, env.WithParser(zerolog.ParseLevel)),
 	SSHPort:                     env.Get("SSH_PORT", 2222),
 	HTTPPort:                    env.Get("HTTP_PORT", 8181),
@@ -48,11 +51,13 @@ func main() {
 
 	zerolog.SetGlobalLevel(cfg.LogLevel)
 	zerolog.TimeFieldFormat = time.RFC3339Nano
-	logger := zerolog.New(os.Stdout)
+	logger := zerolog.New(os.Stdout).With().Str("env", cfg.Env.String()).Logger()
+
+	logger.Info().Msgf("starting server")
 
 	sshSrv := newSSHServer(ctx, logger)
 	go func() {
-		logger.Info().Msgf("listening for ssh at %s%s", cfg.BaseURL, sshSrv.Addr)
+		logger.Info().Msgf("listening for ssh at %s:%d", cfg.BaseURL, cfg.SSHPort)
 		if err := sshSrv.ListenAndServe(); err != nil && !errors.Is(err, ssh.ErrServerClosed) {
 			logger.Fatal().Err(err).Send()
 		}
@@ -60,7 +65,7 @@ func main() {
 
 	httpSrv := newHTTPServer(logger)
 	go func() {
-		logger.Info().Msgf("listening for http at %s%s", cfg.BaseURL, httpSrv.Addr)
+		logger.Info().Msgf("listening for http at %s:%d", cfg.BaseURL, cfg.HTTPPort)
 		if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			logger.Fatal().Err(err).Send()
 		}
@@ -127,7 +132,7 @@ func newSSHServer(ctx context.Context, logger zerolog.Logger) *ssh.Server {
 			b := make([]byte, hex.DecodedLen(cfg.IDLength))
 			_, err := rnd.Read(b)
 			if err != nil {
-				logger.Error().Err(err).Msg("rand reading id")
+				logger.Error().Err(err).Msg("creating id")
 				return
 			}
 
@@ -135,7 +140,10 @@ func newSSHServer(ctx context.Context, logger zerolog.Logger) *ssh.Server {
 
 			logger = logger.With().Str("id", id).Logger()
 
-			_, err = s.Write([]byte(fmt.Sprintf("%s:%d?id=%s\n", cfg.BaseURL, cfg.HTTPPort, id)))
+			timeoutDuration := time.Second * time.Duration(cfg.SSHConnectionTimeoutSeconds)
+
+			downloadURL := color.New(color.FgCyan).Add(color.Underline).Sprintf("%s/%s", baseURL(cfg), id)
+			_, err = s.Write([]byte(fmt.Sprintf("\n👋 Your connection stays open until someone downloads your file. Share the link to begin the download.\n\n\t🔗 %s\n\n⏳ Your link expires in %s. waiting for download...\n", downloadURL, timeoutDuration.String())))
 			if err != nil {
 				logger.Error().Err(err).Msg("writing id")
 				return
@@ -146,7 +154,6 @@ func newSSHServer(ctx context.Context, logger zerolog.Logger) *ssh.Server {
 				delete(tunnels, id)
 			}()
 
-			timeoutDuration := time.Second * time.Duration(cfg.SSHConnectionTimeoutSeconds)
 			timer := time.NewTimer(timeoutDuration)
 			defer timer.Stop()
 
@@ -174,7 +181,7 @@ func newSSHServer(ctx context.Context, logger zerolog.Logger) *ssh.Server {
 				}
 
 				logger.Info().Msgf("wrote %d bytes", n)
-				s.Write([]byte(fmt.Sprintf("wrote %d bytes\n", n)))
+				s.Write([]byte(fmt.Sprintf("✅ wrote %d bytes\n", n)))
 				tunnel.done <- nil
 			}
 		},
@@ -184,9 +191,35 @@ func newSSHServer(ctx context.Context, logger zerolog.Logger) *ssh.Server {
 }
 
 func newHTTPServer(logger zerolog.Logger) *http.Server {
-	mux := http.NewServeMux()
-	mux.Handle("/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		id := r.URL.Query().Get("id")
+	router := chi.NewMux()
+
+	router.Use(func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			logger := logger.With().Str("remote", r.RemoteAddr).Logger()
+			r = r.WithContext(logger.WithContext(r.Context()))
+
+			ww := &wrappedWriter{ResponseWriter: w}
+			wbody := &wrappedBody{ReadCloser: r.Body}
+			r.Body = wbody
+
+			next.ServeHTTP(ww, r)
+
+			logger.Info().
+				Str("url", r.URL.String()).
+				Str("method", r.Method).
+				Int("code", ww.code).
+				Int64("bytesWritten", ww.written).
+				Int64("bytesRead", wbody.read).
+				Send()
+		})
+	})
+
+	router.Get(cfg.HTTPHealthCheckEndpoint, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	router.Get("/{id}", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		id := chi.URLParam(r, "id")
 
 		logger := logger.With().Str("id", id).Logger()
 
@@ -211,36 +244,10 @@ func newHTTPServer(logger zerolog.Logger) *http.Server {
 			return
 		}
 	}))
-	mux.Handle(cfg.HTTPHealthCheckEndpoint, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
-
-	handler := alice.New(
-		func(next http.Handler) http.Handler {
-			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				logger := logger.With().Str("remote", r.RemoteAddr).Logger()
-				r = r.WithContext(logger.WithContext(r.Context()))
-
-				ww := &wrappedWriter{ResponseWriter: w}
-				wbody := &wrappedBody{ReadCloser: r.Body}
-				r.Body = wbody
-
-				next.ServeHTTP(ww, r)
-
-				logger.Info().
-					Str("url", r.URL.String()).
-					Str("method", r.Method).
-					Int("code", ww.code).
-					Int64("bytesWritten", ww.written).
-					Int64("bytesRead", wbody.read).
-					Send()
-			})
-		},
-	).Then(mux)
 
 	srv := &http.Server{
 		Addr:    fmt.Sprintf(":%d", cfg.HTTPPort),
-		Handler: handler,
+		Handler: router,
 	}
 
 	return srv
@@ -277,4 +284,35 @@ func (w *wrappedBody) Read(p []byte) (int, error) {
 	n, err := w.ReadCloser.Read(p)
 	w.read += int64(n)
 	return n, err
+}
+
+type environment string
+
+func (e environment) String() string {
+	return string(e)
+}
+
+const (
+	environmentLocal environment = "local"
+	environmentProd  environment = "prod"
+)
+
+func parseEnvironment(e string) (environment, error) {
+	_e := environment(e)
+
+	switch _e {
+	case environmentLocal, environmentProd:
+		return _e, nil
+
+	default:
+		return "", fmt.Errorf("invalid environment %s", e)
+	}
+}
+
+func baseURL(cfg config) string {
+	if cfg.Env == environmentLocal {
+		return fmt.Sprintf("%s:%d", cfg.BaseURL, cfg.HTTPPort)
+	}
+
+	return cfg.BaseURL
 }
