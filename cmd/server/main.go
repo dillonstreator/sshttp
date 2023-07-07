@@ -31,6 +31,7 @@ type config struct {
 	ShutdownTimeoutSeconds      int
 	HTTPHealthCheckEndpoint     string
 	BaseURL                     string
+	IDMaxGenerationAttempts     int
 }
 
 var cfg = config{
@@ -43,6 +44,7 @@ var cfg = config{
 	ShutdownTimeoutSeconds:      env.Get("SHUTDOWN_TIMEOUT_SECONDS", 15),
 	HTTPHealthCheckEndpoint:     env.Get("HTTP_HEALTH_CHECK_ENDPOINT", "/health"),
 	BaseURL:                     env.Get("BASE_URL", "http://localhost"),
+	IDMaxGenerationAttempts:     env.Get("ID_MAX_GENERATION_ATTEMPTS", 10),
 }
 
 func main() {
@@ -129,21 +131,35 @@ func newSSHServer(ctx context.Context, logger zerolog.Logger) *ssh.Server {
 
 			logger := logger.With().Str("user", s.User()).Str("remote", s.RemoteAddr().String()).Logger()
 
-			b := make([]byte, hex.DecodedLen(cfg.IDLength))
-			_, err := rnd.Read(b)
-			if err != nil {
-				logger.Error().Err(err).Msg("creating id")
-				return
-			}
+			var id string
+			attempts := 0
+			for {
+				if attempts > cfg.IDMaxGenerationAttempts {
+					s.Write([]byte(fmt.Sprintf("max %d attempts reached attempting to generating unused id", cfg.IDMaxGenerationAttempts)))
+					return
+				}
 
-			id := hex.EncodeToString(b)
+				b := make([]byte, hex.DecodedLen(cfg.IDLength))
+				_, err := rnd.Read(b)
+				if err != nil {
+					logger.Error().Err(err).Msg("creating id")
+					return
+				}
+
+				id = hex.EncodeToString(b)
+				if _, exists := tunnels[id]; !exists {
+					break
+				}
+
+				attempts++
+			}
 
 			logger = logger.With().Str("id", id).Logger()
 
 			timeoutDuration := time.Second * time.Duration(cfg.SSHConnectionTimeoutSeconds)
 
 			downloadURL := color.New(color.FgCyan).Add(color.Underline).Sprintf("%s/%s", baseURL(cfg), id)
-			_, err = s.Write([]byte(fmt.Sprintf("\n👋 Your connection stays open until someone downloads your file. Share the link to begin the download.\n\n\t🔗 %s\n\n⏳ Your link expires in %s. waiting for download...\n", downloadURL, timeoutDuration.String())))
+			_, err := s.Write([]byte(fmt.Sprintf("\n👋 Your connection stays open until someone downloads your file. Share the link to begin the download.\n\n\t🔗 %s\n\n⏳ Your link expires in %s. waiting for download...\n", downloadURL, timeoutDuration.String())))
 			if err != nil {
 				logger.Error().Err(err).Msg("writing id")
 				return
