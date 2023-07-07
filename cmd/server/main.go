@@ -120,6 +120,7 @@ type tunnel struct {
 }
 
 var tunnels = make(map[string]chan *tunnel)
+var tunnelsMu = sync.Mutex{}
 
 func newSSHServer(ctx context.Context, logger zerolog.Logger) *ssh.Server {
 	rnd := rand.New(rand.NewSource(time.Now().UnixNano()))
@@ -131,11 +132,17 @@ func newSSHServer(ctx context.Context, logger zerolog.Logger) *ssh.Server {
 
 			logger := logger.With().Str("user", s.User()).Str("remote", s.RemoteAddr().String()).Logger()
 
+			tunnelsMu.Lock()
+
 			var id string
 			attempts := 0
 			for {
 				if attempts > cfg.IDMaxGenerationAttempts {
-					s.Write([]byte(fmt.Sprintf("max %d attempts reached attempting to generating unused id", cfg.IDMaxGenerationAttempts)))
+					err := fmt.Errorf("max %d attempts reached generating id", cfg.IDMaxGenerationAttempts)
+
+					logger.Error().Err(err).Send()
+					s.Write([]byte(err.Error()))
+					tunnelsMu.Unlock()
 					return
 				}
 
@@ -143,6 +150,7 @@ func newSSHServer(ctx context.Context, logger zerolog.Logger) *ssh.Server {
 				_, err := rnd.Read(b)
 				if err != nil {
 					logger.Error().Err(err).Msg("creating id")
+					tunnelsMu.Unlock()
 					return
 				}
 
@@ -166,8 +174,11 @@ func newSSHServer(ctx context.Context, logger zerolog.Logger) *ssh.Server {
 			}
 
 			tunnels[id] = make(chan *tunnel)
+			tunnelsMu.Unlock()
 			defer func() {
+				tunnelsMu.Lock()
 				delete(tunnels, id)
+				tunnelsMu.Unlock()
 			}()
 
 			timer := time.NewTimer(timeoutDuration)
