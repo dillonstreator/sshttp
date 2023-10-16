@@ -184,6 +184,8 @@ func newSSHServer(ctx context.Context, logger zerolog.Logger) *ssh.Server {
 			timer := time.NewTimer(timeoutDuration)
 			defer timer.Stop()
 
+			logger.Debug().Msg("waiting for tunnel or cancellation")
+
 			select {
 			case <-timer.C:
 				logger.Info().Msgf("%s timeout reached", timeoutDuration.String())
@@ -200,6 +202,9 @@ func newSSHServer(ctx context.Context, logger zerolog.Logger) *ssh.Server {
 				return
 
 			case tunnel := <-tunnels[id]:
+				logger.Debug().Msg("tunnel received")
+				s.Write([]byte("tunnel received - starting transfer\n"))
+
 				n, err := io.Copy(tunnel.w, s)
 				if err != nil {
 					tunnel.done <- err
@@ -229,6 +234,11 @@ func newHTTPServer(logger zerolog.Logger) *http.Server {
 			wbody := &wrappedBody{ReadCloser: r.Body}
 			r.Body = wbody
 
+			logger.Info().
+				Str("url", r.URL.String()).
+				Str("method", r.Method).
+				Msg("request received")
+
 			next.ServeHTTP(ww, r)
 
 			logger.Info().
@@ -237,7 +247,7 @@ func newHTTPServer(logger zerolog.Logger) *http.Server {
 				Int("code", ww.code).
 				Int64("bytesWritten", ww.written).
 				Int64("bytesRead", wbody.read).
-				Send()
+				Msg("response sent")
 		})
 	})
 
@@ -252,10 +262,12 @@ func newHTTPServer(logger zerolog.Logger) *http.Server {
 
 		tCh, ok := tunnels[id]
 		if !ok {
-			logger.Warn().Msg("tunnel not found")
+			logger.Debug().Msg("tunnel channel not found")
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
+
+		logger.Debug().Msg("tunnel channel found")
 
 		done := make(chan error)
 		defer func() { close(done) }()
@@ -264,7 +276,12 @@ func newHTTPServer(logger zerolog.Logger) *http.Server {
 			done: done,
 		}
 
+		logger.Debug().Msg("tunnel sent")
+
 		err := <-done
+
+		logger.Debug().Err(err).Msg("done received")
+
 		if err != nil {
 			logger.Error().Err(err).Send()
 			w.WriteHeader(http.StatusInternalServerError)
