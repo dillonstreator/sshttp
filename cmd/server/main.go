@@ -32,6 +32,7 @@ type config struct {
 	HTTPHealthCheckEndpoint     string
 	BaseURL                     string
 	IDMaxGenerationAttempts     int
+	MaxTransferBytes            int64
 }
 
 var cfg = config{
@@ -45,6 +46,7 @@ var cfg = config{
 	HTTPHealthCheckEndpoint:     env.Get("HTTP_HEALTH_CHECK_ENDPOINT", "/health"),
 	BaseURL:                     env.Get("BASE_URL", "http://localhost"),
 	IDMaxGenerationAttempts:     env.Get("ID_MAX_GENERATION_ATTEMPTS", 10),
+	MaxTransferBytes:            env.Get("MAX_TRANSFER_BYTES", int64(1024*1024*10)),
 }
 
 func main() {
@@ -57,7 +59,7 @@ func main() {
 
 	logger.Info().Msgf("starting server")
 
-	sshSrv := newSSHServer(ctx, logger)
+	sshSrv := newSSHServer(ctx, cfg, logger)
 	go func() {
 		logger.Info().Msgf("listening for ssh traffic at port %d", cfg.SSHPort)
 		if err := sshSrv.ListenAndServe(); err != nil && !errors.Is(err, ssh.ErrServerClosed) {
@@ -122,7 +124,7 @@ type tunnel struct {
 var tunnels = make(map[string]chan *tunnel)
 var tunnelsMu = sync.Mutex{}
 
-func newSSHServer(ctx context.Context, logger zerolog.Logger) *ssh.Server {
+func newSSHServer(ctx context.Context, cfg config, logger zerolog.Logger) *ssh.Server {
 	rnd := rand.New(rand.NewSource(time.Now().UnixNano()))
 
 	srv := &ssh.Server{
@@ -200,7 +202,12 @@ func newSSHServer(ctx context.Context, logger zerolog.Logger) *ssh.Server {
 				return
 
 			case tunnel := <-tunnels[id]:
-				n, err := io.Copy(tunnel.w, s)
+				var reader io.Reader = s
+				if cfg.MaxTransferBytes > 0 {
+					reader = io.LimitReader(reader, cfg.MaxTransferBytes)
+				}
+
+				n, err := io.Copy(tunnel.w, reader)
 				if err != nil {
 					tunnel.done <- err
 					logger.Error().Err(err).Msg("copying to tunnel")

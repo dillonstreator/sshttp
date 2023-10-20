@@ -71,6 +71,14 @@ func Get[T any](key string, def T, optFns ...getOptFn[T]) T {
 
 		*ptr = i
 
+	case *int64:
+		i, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			return def
+		}
+
+		*ptr = i
+
 	case *string:
 		*ptr = v
 
