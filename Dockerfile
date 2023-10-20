@@ -16,6 +16,4 @@ WORKDIR /app
 
 COPY --from=builder /app/server .
 
-EXPOSE $PORT/tcp
-
 CMD ["./server"]
